@@ -10,7 +10,7 @@ from lvkit.codegen.builder import topological_sort_tiered
 from lvkit.codegen.context import CodeGenContext
 from lvkit.codegen.nodes import case, invoke_node, nmux, property_node
 from lvkit.graph import InMemoryVIGraph
-from lvkit.graph.models import CaseStructureNode, PrimitiveNode, WireEnd
+from lvkit.graph.models import CaseStructureNode, PrimitiveNode, Wire, WireEnd
 from lvkit.models import (
     CaseFrame,
     ClusterField,
@@ -261,12 +261,12 @@ class TestNMuxRoles:
 # ── Property node dedup ────────────────────────────────────────────
 
 
-class TestPropertyDedup:
-    """Property node generates one read per output terminal, not per property."""
+class TestPropertyReads:
+    """Each saved property row executes exactly once."""
 
-    def test_no_triple_reads(self):
-        """3 properties + 1 wired output = 1 read, not 3."""
-        graph = make_graph_with_terminals("ref_in", "out_1")
+    def test_three_rows_with_one_wired_result(self):
+        """Unwired read results do not remove their property accesses."""
+        graph = make_graph_with_terminals("ref_in", "out_1", "out_2", "out_3")
         ctx = CodeGenContext(graph=graph)
         ctx.bind("ref_in", "my_ref")
 
@@ -288,18 +288,69 @@ class TestPropertyDedup:
             node_type="propNode",
             terminals=[
                 Terminal(id="ref_in", index=0, direction="input"),
-                Terminal(id="out_1", index=1, direction="output"),
+                Terminal(id="out_1", index=4, direction="output"),
+                Terminal(id="out_2", index=5, direction="output"),
+                Terminal(id="out_3", index=6, direction="output"),
             ],
             properties=[
                 PropertyDef(segments=[PropertySegment(name="controls", code=0)]),
                 PropertyDef(segments=[PropertySegment(name="indicator", code=0)]),
                 PropertyDef(segments=[PropertySegment(name="value", code=0)]),
             ],
+            property_value_terminal_ids=["out_1", "out_2", "out_3"],
         )
         fragment = property_node.generate(op, ctx)
-        # Should only have 1 assignment, not 3
         assigns = [s for s in fragment.statements if isinstance(s, ast.Assign)]
-        assert len(assigns) == 1
+        assert len(assigns) == 3
+        assert [
+            s.value.attr for s in assigns if isinstance(s.value, ast.Attribute)
+        ] == ["controls", "indicator", "value"]
+
+    def test_each_property_uses_its_own_terminal(self):
+        """Write ActiveDev, then read DevIsSimulated / ProductType / BusType
+        with only the last two wired (DCAF Config.vi's DAQmx Device node):
+        each wired terminal gets ITS property, not the next one in line."""
+        ctx = CodeGenContext.from_wires(
+            [
+                Wire.from_terminals(
+                    from_terminal_id="ref_src", to_terminal_id="ref_in"
+                ),
+                Wire.from_terminals(from_terminal_id="name_src", to_terminal_id="dev"),
+                Wire.from_terminals(from_terminal_id="prod", to_terminal_id="sink_1"),
+                Wire.from_terminals(from_terminal_id="bus", to_terminal_id="sink_2"),
+            ]
+        )
+        ctx.bind("ref_src", "device")
+        ctx.bind("name_src", "device_name")
+        op = PrimitiveNode(
+            id="prop_1",
+            vi_path="test.vi",
+            name="Property Node",
+            node_type="propNode",
+            terminals=[
+                Terminal(id="ref_in", index=0, direction="input"),
+                Terminal(id="dev", index=4, direction="input"),
+                Terminal(id="sim", index=5, direction="output"),
+                Terminal(id="prod", index=6, direction="output"),
+                Terminal(id="bus", index=7, direction="output"),
+            ],
+            properties=[
+                PropertyDef(segments=[PropertySegment(name=name, code=0)])
+                for name in ("ActiveDev", "DevIsSimulated", "ProductType", "BusType")
+            ],
+            property_value_terminal_ids=["dev", "sim", "prod", "bus"],
+        )
+        fragment = property_node.generate(op, ctx)
+        module = ast.Module(body=fragment.statements, type_ignores=[])
+        code = ast.unparse(ast.fix_missing_locations(module)).splitlines()
+        assert code == [
+            "device.activedev = device_name",
+            "device_devissimulated = device.devissimulated",
+            "device_producttype = device.producttype",
+            "device_bustype = device.bustype",
+        ]
+        assert fragment.bindings["prod"] == "device_producttype"
+        assert fragment.bindings["bus"] == "device_bustype"
 
 
 class TestNestedPropertyChain:

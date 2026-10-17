@@ -3,6 +3,7 @@
 lvkit follows semantic versioning.
 
 ## [Unreleased]
+- **Fix: generated Python read and wrote the wrong Property Node property, out of order** — each row now reads or writes its own terminal in the node's top-to-bottom order (unwired reads included), so a node that writes one property and reads others no longer shifts every value by one.
 - **Fix: a nested Property Node property (`Label.Text`) shifted every later row's name by one** — it is now one row named `Label.Text` (generated Python reads `ref.label.text`), so each row after it keeps its own name and terminal in render, `describe`, lvnet and codegen.
 - **Fix: lvnet named a loop's iteration terminal `For Loop::0`/`While Loop::0`** — ambiguous with two loops and lost on read-back; it is now the loop's own `loop_<uid>::i`.
 - **Fix: a VI calling LabVIEW install files (`<resource>`, `<extravilib>`) no longer fails with "Ambiguous VI reference"** — those paths were joined onto each caller's own folder, so one dependency got a different identity per caller; every unconfigured symbolic root is now handled like `<vilib>`.
