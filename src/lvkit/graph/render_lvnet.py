@@ -34,6 +34,8 @@ from .lvnet_grammar import (
     _FRONT_PANEL_HEADER_LINE,
     _LVNET_ANNOTATION_SEP,
     _LVNET_BLOCK_OPEN,
+    _LVNET_CAPTION_HIDDEN_KEYWORD,
+    _LVNET_CAPTION_KEYWORD,
     _LVNET_CLUSTER_OPEN,
     _LVNET_DEFAULT_KEYWORD,
     _LVNET_DEFAULT_PAREN_PREFIX,
@@ -921,6 +923,8 @@ def _render_lvnet_source(source: NetRef | DefaultValue, handles: _LvnetHandles) 
     # the ``case_UID.outK``-shaped structure-net regex), so routing it
     # through unconditionally is safe and keeps one call site for every
     # ``bare`` shape (net name, structure net, or literal).
+    if source.boundary:
+        return lvnet_name_token(source.bare)
     literal = source.lvnet_value if source.lvnet_value is not None else source.bare
     return _lvnet_net_separator(literal)
 
@@ -1453,7 +1457,8 @@ _LVNET_NAME_UNSAFE_SEQS = (" : ", ", ", " = ")
 
 def _lvnet_name_is_safe_bare(name: str) -> bool:
     """Whether a NAME can render BARE without breaking the parser. It is safe
-    unless it (a) is empty or has leading/trailing whitespace, (b) contains a
+    unless it (a) is empty, has leading/trailing whitespace or contains a
+    control character (U+0000-U+001F, e.g. a line break), (b) contains a
     column-delimiter SEQUENCE (`` : `` / ``, `` / `` = ``) at all -- a bare
     ``:``/``,``/``=`` with no surrounding spaces is fine, e.g. ``(None: Create
     New)`` -- or (c) carries an UNBALANCED quote or brace/bracket, which would
@@ -1464,6 +1469,7 @@ def _lvnet_name_is_safe_bare(name: str) -> bool:
     return bool(
         name
         and name == name.strip()
+        and not any(ord(ch) < 0x20 for ch in name)
         and not any(seq in name for seq in _LVNET_NAME_UNSAFE_SEQS)
         and name.count('"') % 2 == 0
         and name.count("{") == name.count("}")
@@ -1592,12 +1598,26 @@ def _lvnet_pane_index_suffix(pane: ConnectorPaneTerminal) -> str | None:
     return f"{_LVNET_PANE_INDEX_PREFIX}{pane.index}"
 
 
+def _lvnet_caption_trailing(pane: ConnectorPaneTerminal) -> str | None:
+    """The verbose ``caption "<text>"`` clause of a boundary row (``caption
+    hidden "<text>"`` when the caption is set but not shown), or ``None`` when
+    the control has no caption. The text uses the string-literal escaping, so
+    a multi-line caption stays on one physical line."""
+    if pane.caption is None:
+        return None
+    text = lvnet_literal_token(pane.caption)
+    if pane.caption_visible:
+        return f"{_LVNET_CAPTION_KEYWORD} {text}"
+    return f"{_LVNET_CAPTION_KEYWORD} {_LVNET_CAPTION_HIDDEN_KEYWORD} {text}"
+
+
 def _lvnet_boundary_trailing(
     pane: ConnectorPaneTerminal, *, verbose: bool
 ) -> str | None:
     """The trailing text for a BOUNDARY (connector-pane) terminal line: the
-    §5 requirement keyword and the control's own §4 ``default <value>``
-    clause (both VERBOSE-only, space-joined in that order -- §5's own worked
+    §5 requirement keyword, the control's own §4 ``default <value>``
+    clause and its front-panel ``caption`` clause (all VERBOSE-only,
+    space-joined in that order -- §5's own worked
     example composes exactly this way: ``error in (no error) : Error
     optional default (no error)``), followed by the Phase 2 ``@<index>``
     column (``_lvnet_pane_index_suffix``, unconditional -- present in terse
@@ -1620,6 +1640,9 @@ def _lvnet_boundary_trailing(
             parts.append(
                 f"{_LVNET_DEFAULT_KEYWORD} {lvnet_literal_token(pane.default)}"
             )
+        caption = _lvnet_caption_trailing(pane)
+        if caption is not None:
+            parts.append(caption)
     index_suffix = _lvnet_pane_index_suffix(pane)
     if index_suffix is not None:
         parts.append(index_suffix)
@@ -1647,10 +1670,9 @@ def _render_lvnet_front_panel(
     front-panel control/indicator (a control/indicator that exists on the
     front panel but was never wired onto the connector pane,
     ``ConnectorPaneTerminal.index is None`` -- ``netlist_build.
-    _off_pane_terminals``/``_pane_terminal``'s ``off_pane=True``), which has
-    no counterpart in ``module.inputs``/``.outputs`` at all (an off-pane
-    object never drives/reads the VI's own boundary wiring -- it's a
-    front-panel object declaration only). Rendered as its OWN
+    _pane_terminal``'s ``off_pane=True``), which has no counterpart in
+    ``module.inputs``/``.outputs`` (a wired off-pane indicator is also in
+    ``module.off_pane_outputs``, for its drive line). Rendered as its OWN
     ``_render_term_group`` call, after the on-pane block: a separate column-
     alignment group (§16's "per group, never globally" rule) so an off-pane
     name/type never widens or narrows the on-pane block's own columns --
@@ -1869,12 +1891,13 @@ def render_lvnet(
     # dedicated ljust-padded form, so this now parses through the SAME
     # generic bare-drive path every other scope's own drives use (see
     # ``lvnet_parse._parse_items``/``_parse_one_item_or_drive``).
-    if module.outputs:
-        for o in module.outputs:
-            source_str = (
-                _render_lvnet_source(o.source, handles) if o.source is not None else "?"
-            )
-            lines.append(f"{body_indent}{o.name}{_LVNET_DRIVER_OP}{source_str}")
+    for o in (*module.outputs, *module.off_pane_outputs):
+        source_str = (
+            _render_lvnet_source(o.source, handles) if o.source is not None else "?"
+        )
+        lines.append(
+            f"{body_indent}{lvnet_name_token(o.name)}{_LVNET_DRIVER_OP}{source_str}"
+        )
 
     if verbose:
         _render_lvnet_types(module, lines)
