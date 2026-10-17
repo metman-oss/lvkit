@@ -3,6 +3,22 @@
 lvkit follows semantic versioning.
 
 ## [Unreleased]
+
+## [0.8.8] - 2026-10-17
+- **Rings name their items** — a ring control, cluster field or constant shows its items and their values in `describe`, lvnet and JSON (`Ring{ PCI = 12582, PXI = 12583, … }`), not a bare integer; a ring constant (such as a .NET enum) draws as its item name (#146).
+- **Five more Event Structure events are named** — Mouse Down, Mouse Up, Menu Selection (User), Application Instance Close and Panel Close? show their name instead of `<unknown event 0x...>` (#147).
+- **Fix: local variables were named after and wired to the wrong control** — a local now resolves to its control by the front panel's own control order, not drawing order, so a panel whose controls were ever reordered reads correctly in every view (#140).
+- **Fix: generated Python concatenated a literal array onto another instead of adding element-wise** — Add with an array constant now adds each element, as LabVIEW does (#118).
+- **Fix: a saved enum or ring default on a connector-pane input was dropped from the generated function's parameter** — it is now the parameter's default (#119).
+- **Fix: NaN and infinity constants generated code that would not run** — scalar, array and cluster constants now emit `float('nan')` / `float('inf')` (#120).
+- **Fix: a VI output whose label starts with `_` broke the generated result type and every SubVI call reading it** — result field names are normalized once and read the same way at each call (#121).
+- **Fix: generated floating-point Divide raised on division by zero** — any floating-point quotient now returns LabVIEW's signed infinity or NaN (#122).
+- **Logarithm Base 10 generates for every real numeric type, scalars and arrays** (#123).
+- **Fix: an anonymous cluster on the connector pane was annotated as a named object** — it is a tuple in the generated signature, nested arrays of clusters included (#124).
+- **Fix: an expanded Index Array (several outputs) generated code that raised `TypeError`** — each output row now reads its own index, with unwired indices counting up from the one above (#125).
+- **Fix: Bundle/Unbundle By Name on a nested anonymous cluster generated code that raised `AttributeError`** — nested fields are read and replaced by position (#126).
+- **Fix: converting a `.llb` could silently skip members** — the archive stays open until every member has been read (#127).
+- **Fix: a Case Structure whose first frame is Default got the wrong Default frame** — LabVIEW 2010+ VIs now read it from the case's saved selector data, and a Default frame that also lists values reads `0, Default` (#128).
 - **Fix: generated Python read and wrote the wrong Property Node property, out of order** — each row now reads or writes its own terminal in the node's top-to-bottom order (unwired reads included), so a node that writes one property and reads others no longer shifts every value by one.
 - **Fix: a nested Property Node property (`Label.Text`) shifted every later row's name by one** — it is now one row named `Label.Text` (generated Python reads `ref.label.text`), so each row after it keeps its own name and terminal in render, `describe`, lvnet and codegen.
 - **Fix: lvnet named a loop's iteration terminal `For Loop::0`/`While Loop::0`** — ambiguous with two loops and lost on read-back; it is now the loop's own `loop_<uid>::i`.
