@@ -46,6 +46,11 @@ This is not "try harder." It is a hard gate: unverified → unsaid; unwritten co
 - **Never ship a hard-coded / string-matched / heuristic fix.** If a fix keys off a string label (`flavor.endswith("Waveform")`, a literal `"Digitaldata"`) or a hand-written index→name table, that is precisely the kind of fix that is NOT trusted here — surface it as a finding, flag it as suspect, and let the maintainer direct a generic, data-driven solution.
 - **Investigation means:** parse/grep/read to find the real root cause and where the correct data actually lives in the pipeline. Report that. Then STOP and wait.
 - This is a hard gate, same standing as VERIFY BEFORE CLAIMING. Persisted in memory: `feedback_bugs_investigate_then_discuss`.
+- **Inside an APPROVED task, "done" means it ALL works — no trail of follow-on fixes.** A bug you hit while finishing an approved task (a regression it exposes, a failing check, a broken round-trip, a stale test) is part of that task: find the root cause AND fix it generically (the no-hard-coded rule above still applies), then report the finished result ONCE. Never end with "fixed X, found Y, didn't fix it". Ask only for a genuine design fork, once, with a recommendation. The investigate-then-wait gate above is for a standalone bug report. Persisted in memory: `feedback_done_means_no_trail`.
+
+## ⛔ NO JARGON — SAY IT IN LABVIEW'S WORDS (READ THIS FIRST)
+
+In replies to the maintainer AND in anything lvkit shows a user (CLI text, `--format json` values, MCP results, viewer labels), use the LabVIEW term: "shift register", "loop output tunnel", "case output tunnel", "connector pane", "Bundle/Unbundle By Name", "In Place Element". Never compiler/Gated-SSA/heap jargon (gamma, mu, eta, decompose, nMux, dco, VCTP) or an internal class name as the explanation — an identifier appears only in backticks as a code pointer. Scan every reply for it before sending. Persisted in memory: `feedback_no_jargon`.
 
 ## ⛔ NEVER REFERENCE A REMOVED/OLD DESIGN IN CODE (READ THIS FIRST)
 
