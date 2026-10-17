@@ -469,7 +469,10 @@ def _iter_lv_types_in_items(items: list[NetlistItem]) -> Iterator[LVType]:
 
 
 def iter_named_subtypes(
-    lv_type: LVType, _visited: set[int] | None = None
+    lv_type: LVType,
+    _visited: set[int] | None = None,
+    *,
+    claimed: dict[str, LVType] | None = None,
 ) -> Iterator[tuple[str, LVType]]:
     """Every NAMED type (§10) reachable from ``lv_type`` -- itself (if
     named) plus every named type nested inside it (an array's element, a
@@ -489,6 +492,12 @@ def iter_named_subtypes(
     from infinite recursion; a real cycle already bottoms out at a
     ``Recursive`` PRIMITIVE placeholder in practice (``type_mapping.py``), so
     this is a defensive belt only.
+
+    ``claimed`` (name -> the occurrence the caller keeps for that name) makes the
+    walk follow only what the footnote actually spells: a named type another
+    occurrence already holds is neither yielded nor descended into, since its own
+    def is not what the footnote prints. The caller records each yielded name in
+    ``claimed`` before the walk resumes.
     """
     if _visited is None:
         _visited = set()
@@ -497,15 +506,17 @@ def iter_named_subtypes(
     _visited.add(id(lv_type))
     name = lvnet_named_stem(lv_type)
     if name is not None:
+        if claimed is not None and claimed.get(name, lv_type) is not lv_type:
+            return
         yield name, lv_type
     if lv_type.kind == LVTypeKind.ARRAY and lv_type.element_type is not None:
-        yield from iter_named_subtypes(lv_type.element_type, _visited)
+        yield from iter_named_subtypes(lv_type.element_type, _visited, claimed=claimed)
     elif (
         lv_type.kind == LVTypeKind.PRIMITIVE
         and lv_type.underlying_type == "Refnum"
         and lv_type.element_type is not None
     ):
-        yield from iter_named_subtypes(lv_type.element_type, _visited)
+        yield from iter_named_subtypes(lv_type.element_type, _visited, claimed=claimed)
     elif (
         lv_type.kind in (LVTypeKind.CLUSTER, LVTypeKind.TYPEDEF_REF)
         and lv_type.fields
@@ -513,7 +524,7 @@ def iter_named_subtypes(
     ):
         for f in lv_type.fields:
             if f.type is not None:
-                yield from iter_named_subtypes(f.type, _visited)
+                yield from iter_named_subtypes(f.type, _visited, claimed=claimed)
 
 
 def _collect_lvnet_named_types(module: NetlistModule) -> dict[str, LVType]:
@@ -534,7 +545,7 @@ def _collect_lvnet_named_types(module: NetlistModule) -> dict[str, LVType]:
         sources.extend(t.lv_type for t in dep.interface if t.lv_type is not None)
     sources.extend(_iter_lv_types_in_items(module.body))
     for lv_type in sources:
-        for name, t in iter_named_subtypes(lv_type):
+        for name, t in iter_named_subtypes(lv_type, claimed=seen):
             seen.setdefault(name, t)
     return dict(sorted(seen.items()))
 
@@ -957,6 +968,11 @@ def _lvnet_component(instance: NetlistInstance) -> str:
         return instance.object_name or "?"
     if instance.kind == NetlistInstanceKind.INVOKE_NODE:
         return f"{instance.object_name or '?'}.{instance.method_name or '?'}"
+    if instance.kind == NetlistInstanceKind.SHARED_VARIABLE:
+        return (
+            f"{lvnet_name_token(instance.name)}{_LVNET_TYPE_SEP}"
+            f"{instance.access or '?'}"
+        )
     return instance.name
 
 
@@ -996,6 +1012,9 @@ def _render_lvnet_instance(
     if instance.kind == NetlistInstanceKind.LOCAL_VARIABLE:
         _render_lvnet_local_variable(instance, indent, lines, handles)
         return
+    if instance.kind == NetlistInstanceKind.GLOBAL_VARIABLE:
+        _render_lvnet_global_variable(instance, indent, lines, handles)
+        return
 
     header_kw = _LVNET_INSTANCE_KEYWORDS[instance.kind]
     handle = handles.by_uid[instance.uid]
@@ -1029,6 +1048,56 @@ def _render_lvnet_instance(
     trailing_todo = _OPEN_INSTANCE_TRAILING_TODO.get(instance.kind)
     if trailing_todo is not None:
         lines.append(f"{indent + _LVNET_INDENT}# TODO(lvnet): {trailing_todo}")
+
+
+def _lvnet_global_part_token(name: str, *, may_hold_separator: bool) -> str:
+    """One half of a ``<Global VI>::<control>`` target: the NAME token
+    (``lvnet_name_token``), quoted also when it opens with a quote (it would read
+    back as a quoted token) or -- for the Global VI half, which ends at the first
+    ``::`` -- when it holds the ``::`` separator itself."""
+    if name.startswith('"') or (may_hold_separator and _LVNET_TERMINAL_SEP in name):
+        return lvnet_literal_token(name)
+    return lvnet_name_token(name)
+
+
+def _lvnet_global_target(global_vi: str, control: str) -> str:
+    """``<Global VI>::<control>`` -- the control of a Global VI a global
+    variable node reads or writes (the name-safety rule of §4 applies to both
+    halves)."""
+    return (
+        f"{_lvnet_global_part_token(global_vi, may_hold_separator=True)}"
+        f"{_LVNET_TERMINAL_SEP}"
+        f"{_lvnet_global_part_token(control, may_hold_separator=False)}"
+    )
+
+
+def _render_lvnet_global_variable(
+    instance: NetlistInstance,
+    indent: str,
+    lines: list[str],
+    handles: _LvnetHandles,
+) -> None:
+    """``global-variable <handle> : read <Global VI>::<control>`` / ``global-
+    variable <handle> : write <Global VI>::<control> = <source>`` (§7) -- the
+    same read/write tap shape as a local variable, naming the control of the
+    Global VI it taps. Like a local variable, a read is a SOURCE
+    (``<handle>::<control>`` references its value) and a write a SINK; the
+    Global VI also appears under ``uses :``.
+    """
+    assert instance.global_vi is not None
+    handle = handles.by_uid[instance.uid]
+    target = _lvnet_global_target(instance.global_vi, instance.name)
+    head = f"{indent}{instance.kind.value} {handle}{_LVNET_TYPE_SEP}"
+    if instance.access == "write":
+        binding = instance.inputs[0]
+        if binding.net is not None:
+            source_str = _render_lvnet_source(binding.net, handles)
+        else:
+            assert binding.default is not None
+            source_str = _lvnet_default_token(binding.default)
+        lines.append(f"{head}write {target}{_LVNET_DRIVER_OP}{source_str}")
+        return
+    lines.append(f"{head}read {target}")
 
 
 def _render_lvnet_local_variable(

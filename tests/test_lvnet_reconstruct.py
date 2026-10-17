@@ -39,6 +39,7 @@ from lvkit.load_mode import LoadMode
 _JKI_SOURCE_ROOT = Path(".lvkit/cache/samples/JKI-VI-Tester/source")
 _FLEX_ROOT = Path(".lvkit/cache/samples/lv-flex-channel-examples")
 _AF_ROOT = Path(".lvkit/cache/samples/actor-framework")
+_ICON_EDITOR_ROOT = Path(".lvkit/cache/samples/ni-labview-icon-editor")
 _DCAF_ROOT = Path(".lvkit/cache/samples/DCAF-DAQModule")
 _MEASUREMENT_PLUGIN_ROOT = Path(".lvkit/cache/samples/measurement-plugin-labview")
 
@@ -88,6 +89,21 @@ _IDEMPOTENCE_CASES = [
         _AF_ROOT / "Tooling" / "Force Icon Editor to Unload.vi",
         _AF_ROOT,
         id="Force_Icon_Editor_to_Unload",
+    ),
+    pytest.param(
+        _ICON_EDITOR_ROOT / "resource" / "plugins" / "lv_icon.vi",
+        _ICON_EDITOR_ROOT,
+        id="lv_icon_global_variables",
+    ),
+    pytest.param(
+        _ICON_EDITOR_ROOT
+        / "resource"
+        / "plugins"
+        / "NIIconEditor"
+        / "Global Variables"
+        / "Data.vi",
+        _ICON_EDITOR_ROOT,
+        id="Data_global_vi",
     ),
     pytest.param(
         _DCAF_ROOT / "source" / "module" / "execution" / "init.vi",
