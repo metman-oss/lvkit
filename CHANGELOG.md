@@ -5,6 +5,13 @@ lvkit follows semantic versioning.
 ## [Unreleased]
 
 ## [0.8.8] - 2026-10-17
+- **Fix: a reentrant VI could show as non-reentrant** — LabVIEW records reentrant execution with either of two flags; both are read now, so a VI saved that way shows its real shared or preallocated clone setting (#132).
+- **Fix: `vi_type` named the wrong kind of file (an ordinary VI showed as `Control`)** — it now reads `VI`, `Global VI`, `Control` or `Polymorphic VI`, decoded from the code the file stores (#144).
+- **Fix: a VI whose connector pane has nothing wired put every front-panel control on slot 0** — controls not on the connector pane are listed as front panel only, in describe, lvnet, JSON, the project index and docs; generated Python takes them as keyword-only parameters with their saved defaults (#145).
+- **Fix: lvnet named a control that is not on the connector pane by an internal id, and dropped wires into such indicators** — they are named by label and their wires are kept, so these VIs read back exactly (#145).
+- **Fix: a front-panel label with a line break broke lvnet** — such a name is quoted like one containing ` = ` or ` : `, everywhere a front-panel name appears.
+- **Fix: slot 0's Required/Recommended setting was always lost** — it is read like every other connector-pane slot (#145).
+- **Front-panel captions are shown** — describe shows a visible caption next to its label, JSON carries `caption`/`caption_visible`, verbose lvnet writes `caption "…"`, and diff reports a caption change (#148).
 - **Rings name their items** — a ring control, cluster field or constant shows its items and their values in `describe`, lvnet and JSON (`Ring{ PCI = 12582, PXI = 12583, … }`), not a bare integer; a ring constant (such as a .NET enum) draws as its item name (#146).
 - **Five more Event Structure events are named** — Mouse Down, Mouse Up, Menu Selection (User), Application Instance Close and Panel Close? show their name instead of `<unknown event 0x...>` (#147).
 - **Fix: local variables were named after and wired to the wrong control** — a local now resolves to its control by the front panel's own control order, not drawing order, so a panel whose controls were ever reordered reads correctly in every view (#140).
