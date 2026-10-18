@@ -22,11 +22,11 @@ from ..ast_utils import (
     parse_expr,
     result_field_name,
     to_function_name,
-    to_module_name,
     to_var_name,
 )
 from ..context import CodeGenContext
 from ..fragment import CodeFragment
+from ..import_resolver import ImportResolver
 from ..unresolved import emit_soft_unresolved
 
 
@@ -73,7 +73,7 @@ def generate(node: VINode, ctx: CodeGenContext) -> CodeFragment:
     if vilib_vi and vilib_vi.python_code and vilib_vi.inline:
         return _generate_inline(node, ctx, vilib_vi)
 
-    func_name = to_function_name(subvi_name)
+    func_name = ctx.import_function(subvi_name)
     result_var = ctx.make_output_var(f"{func_name}_result", node.id)
 
     # Gather input arguments with proper names
@@ -106,17 +106,9 @@ def generate(node: VINode, ctx: CodeGenContext) -> CodeFragment:
     # Build output bindings using vilib terminal names
     bindings = _build_output_bindings(node, result_var, vilib_vi, ctx)
 
-    # Build import - use resolver if available, otherwise default relative
-    if ctx.import_resolver:
-        import_stmt = ctx.import_resolver(subvi_name)
-    else:
-        import_stmt = f"from .{func_name} import {func_name}"
-    imports = {import_stmt}
-
     return CodeFragment(
         statements=[stmt],
         bindings=bindings,
-        imports=imports,
     )
 
 
@@ -408,7 +400,9 @@ def _build_arguments(
 
         # Check if this parameter is an enum typedef - generate enum reference
         final_value = (
-            _resolve_enum_value(value, term, vilib_vi, ctx) if vilib_vi else value
+            _resolve_enum_value(value, term, vilib_vi, subvi_name, ctx)
+            if vilib_vi
+            else value
         )
 
         keywords[param_name] = final_value
@@ -420,6 +414,7 @@ def _resolve_enum_value(
     value: str,
     term: Terminal,
     vilib_vi: VIEntry,
+    subvi_name: str,
     ctx: CodeGenContext,
 ) -> str:
     """Resolve enum constant to enum reference if applicable.
@@ -428,26 +423,12 @@ def _resolve_enum_value(
         value: The resolved value (e.g., "7")
         term: Terminal object with type info
         vilib_vi: VI entry with terminal typedef info
+        subvi_name: The called VI, whose module defines the enum class
         ctx: Code generation context
 
     Returns:
         Either the original value or an enum reference like "EnumName.MEMBER"
     """
-    # Check if value is already an enum reference (pre-resolved in graph)
-    if "." in value and not value.replace(".", "").replace("-", "").isdigit():
-        # Extract enum class name and add import
-        enum_class_name = value.split(".")[0]
-        if ctx.import_resolver:
-            import_stmt = ctx.import_resolver(vilib_vi.name)
-            import_stmt = (
-                import_stmt.rsplit(" import ", 1)[0] + f" import {enum_class_name}"
-            )
-            ctx.add_import(import_stmt)
-        else:
-            module = to_module_name(vilib_vi.name)
-            ctx.add_import(f"from .{module} import {enum_class_name}")
-        return value
-
     # Only process constant integers
     if not value.isdigit() and not (value.startswith("-") and value[1:].isdigit()):
         return value
@@ -484,14 +465,13 @@ def _resolve_enum_value(
             if lv_type.typedef_name:
                 package, class_name = derive_python_location(lv_type.typedef_name)
                 # Add import for this enum
-                if ctx.import_resolver:
-                    # Get import statement and replace func name with enum class
-                    import_stmt = ctx.import_resolver(vilib_vi.name)
-                    # Replace the function import with enum class import
-                    import_stmt = (
-                        import_stmt.rsplit(" import ", 1)[0] + f" import {class_name}"
-                    )
-                    ctx.add_import(import_stmt)
+                if isinstance(ctx.import_resolver, ImportResolver):
+                    # The enum class sits in the module of the called VI
+                    module = ctx.import_resolver.function(subvi_name).statement
+                    if module:
+                        ctx.add_import(
+                            module.rsplit(" import ", 1)[0] + f" import {class_name}"
+                        )
                 else:
                     ctx.add_import(f"from {package} import {class_name}")
                 return f"{class_name}.{member_name}"
@@ -624,7 +604,7 @@ def _generate_dynamic_dispatch(node: VINode, ctx: CodeGenContext) -> CodeFragmen
     # Build AST: receiver.method(args...)  or  super().method(args...)
     call = ast.Call(
         func=ast.Attribute(
-            value=ast.Name(id=call_receiver, ctx=ast.Load()),
+            value=parse_expr(call_receiver),
             attr=method_name,
             ctx=ast.Load(),
         ),
@@ -756,6 +736,7 @@ def _generate_static_fallback(
     node: VINode, ctx: CodeGenContext, func_name: str
 ) -> CodeFragment:
     """Fallback for dynIUse with no inputs — generate as static function call."""
+    func_name = ctx.import_function(node.name or func_name)
     result_var = f"{func_name}_result"
     call = ast.Call(
         func=ast.Name(id=func_name, ctx=ast.Load()),
@@ -774,16 +755,7 @@ def _generate_static_fallback(
             field = result_field_name(term.name or f"out_{term.index}")
             bindings[term.id] = f"{result_var}.{field}"
 
-    if ctx.import_resolver:
-        import_stmt = ctx.import_resolver(node.name or func_name)
-    else:
-        import_stmt = f"from .{func_name} import {func_name}"
-
-    return CodeFragment(
-        statements=[stmt],
-        bindings=bindings,
-        imports={import_stmt},
-    )
+    return CodeFragment(statements=[stmt], bindings=bindings)
 
 
 def _is_class_terminal(term: Terminal) -> bool:

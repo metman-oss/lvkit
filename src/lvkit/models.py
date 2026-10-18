@@ -7,7 +7,7 @@ Two groups of types:
 
 The Frame hierarchy (CaseFrame/SequenceFrame/EventFrame) lives here because
 the parser constructs these instances directly, so they must live in a
-parser-importable module — not inside graph/. Frame metadata (selector
+parser-names module — not inside graph/. Frame metadata (selector
 values, ranges, …) is a pure projection out of the graph; a frame's actual
 contents are read from ``InMemoryVIGraph.child_nodes``/``top_level_nodes``,
 never stored on the Frame itself — graph/models.py's ``GraphNode``
@@ -17,11 +17,14 @@ subclasses are the single source of truth for node structure.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 from typing import Literal
 
 from pydantic import BaseModel
+
+from .type_names import derive_python_name, is_enum_member_name
 
 # Type alias for scalar constant/default values
 ScalarValue = str | int | float | bool | None
@@ -117,6 +120,12 @@ _SHARED_VARIABLE_KIND_LABELS: dict[SharedVariableKind, str] = {
 }
 
 
+# The name a module spells a named type's class as -- its own, or an alias when
+# two classes of one module derive the same name -- or None when the module has
+# no class to import for the type.
+TypeNamer = Callable[["LVType"], str | None]
+
+
 @dataclass
 class LVType:
     """LabVIEW type structure - unified representation for all types."""
@@ -150,39 +159,87 @@ class LVType:
     # ``compare=False`` — presentation, never type identity/coercion.
     wire_style: WireStyle | None = field(default=None, compare=False)
 
-    def to_python(self) -> str:
-        """Render as Python type annotation string."""
+    def type_ref(self) -> str | None:
+        """The LabVIEW name of the class or typedef this type names -- the
+        reference a caller's dependencies are searched for -- or None for a type
+        that names neither. A class refnum names its class; a named enum, ring,
+        cluster or typedef reference names its typedef."""
         if self.kind == LVTypeKind.PRIMITIVE:
-            # Refnum with class name → use the class type
-            if self.underlying_type == "Refnum" and self.classname:
-                name = _sanitize_type_name(self.classname.replace(".lvclass", ""))
-                return name or "Any"
+            if self.underlying_type == "Refnum":
+                return self.classname
+            return None
+        if self.kind in (
+            LVTypeKind.CLUSTER,
+            LVTypeKind.ENUM,
+            LVTypeKind.RING,
+            LVTypeKind.TYPEDEF_REF,
+        ):
+            return self.typedef_name
+        return None
+
+    def python_class_name(self) -> str | None:
+        """The class name generated code spells this type as, or None for a type
+        that has no class of its own."""
+        ref = self.type_ref()
+        return derive_python_name(ref) if ref else None
+
+    def named_types(self) -> Iterator[LVType]:
+        """Every type this type's annotation names by class: this type when it
+        has a class name, and each such element type of an array."""
+        if self.python_class_name() is not None:
+            yield self
+        elif self.kind == LVTypeKind.ARRAY and self.element_type is not None:
+            yield from self.element_type.named_types()
+
+    def to_python(self, names: TypeNamer | None = None) -> str:
+        """Render as Python type annotation string.
+
+        ``names`` gives the name the module spells a named class or typedef as,
+        or None when the module can import none. A named type that has none
+        renders as its LabVIEW representation: an ``int`` for an enum or ring,
+        ``Any`` otherwise.
+        """
+        class_name = self.python_class_name()
+        if class_name is not None:
+            local = class_name if names is None else names(self)
+            if local is not None:
+                return local
+            return "int" if self.kind in (LVTypeKind.ENUM, LVTypeKind.RING) else "Any"
+        if self.kind == LVTypeKind.PRIMITIVE:
             return _LV_TO_PYTHON_TYPE.get(self.underlying_type or "", "Any")
         elif self.kind == LVTypeKind.ARRAY:
-            inner = self.element_type.to_python() if self.element_type else "Any"
+            inner = (
+                self.element_type.to_python(names) if self.element_type else "Any"
+            )
             result = f"list[{inner}]"
             for _ in range((self.dimensions or 1) - 1):
                 result = f"list[{result}]"
             return result
         elif self.kind == LVTypeKind.CLUSTER:
-            if self.typedef_name:
-                name = _sanitize_type_name(self.typedef_name)
-                return name or "dict[str, Any]"
             if not self.classname:
                 # An anonymous cluster is generated as a positional tuple.
                 return "tuple"
             return "dict[str, Any]"
         elif self.kind in (LVTypeKind.ENUM, LVTypeKind.RING):
-            if self.typedef_name:
-                name = _sanitize_type_name(self.typedef_name)
-                return name or "int"
             return "int"
-        elif self.kind == LVTypeKind.TYPEDEF_REF:
-            if self.typedef_name:
-                name = _sanitize_type_name(self.typedef_name)
-                return name or "Any"
-            return "Any"
         return "Any"
+
+    def enum_member_ref(
+        self, ordinal: int, names: TypeNamer | None = None
+    ) -> str | None:
+        """``Class.member`` for the item of this named enum or ring whose value
+        is ``ordinal``, spelled with the module's name for the class; None when
+        the type has no importable class, no such item, or an item that cannot
+        be spelled as an attribute."""
+        class_name = self.python_class_name()
+        member = self.member_name(ordinal)
+        if class_name is None or member is None or not is_enum_member_name(member):
+            return None
+        if names is not None:
+            class_name = names(self)
+            if class_name is None:
+                return None
+        return f"{class_name}.{member}"
 
     def item_for(self, raw: ScalarValue) -> str | None:
         """The enum/ring item a recorded default names: ``raw`` is an ordinal
@@ -489,9 +546,9 @@ class Terminal(BaseModel):
     # between them, only this shared DCO.
     dco_uid: str | None = None
 
-    def python_type(self) -> str:
-        """Python type string derived from lv_type."""
-        return self.lv_type.to_python() if self.lv_type else "Any"
+    def python_type(self, names: TypeNamer | None = None) -> str:
+        """Python type string derived from lv_type (see ``LVType.to_python``)."""
+        return self.lv_type.to_python(names) if self.lv_type else "Any"
 
     def type_descriptor(self) -> str:
         """This terminal's exact type descriptor, or ``""`` when its type didn't
@@ -565,29 +622,44 @@ def bundle_unbundle_name(
     return "Bundle" if bundling else "Unbundle"
 
 
-def inplace_border_name(node_type: str, terminals: list[Terminal]) -> str | None:
-    """Faithful per-tile name for the two IN-PLACE-ELEMENT-STRUCTURE border
-    nodes that carry no field shape (unlike ``decomposeClusterNode``, which
-    goes through :func:`bundle_unbundle_name`). Both halves of the pair share a
-    node class; the READ (left) and WRITE (right) tile are told apart purely by
-    which side the distinguishing terminal type sits on -- no guessing:
+class InPlaceBorderSide(str, Enum):
+    """Which half of an In Place Element Structure's border a tile is: the READ
+    tile takes the element out of the data, the WRITE tile puts it back."""
 
+    READ = "read"
+    WRITE = "write"
+
+
+def inplace_border_side(
+    node_type: str, terminals: list[Terminal]
+) -> InPlaceBorderSide | None:
+    """Which half of the structure's border a border node is, told apart purely
+    by the terminals it carries -- no guessing:
+
+    - ``decomposeClusterNode`` -- the field terminals are outputs on the read
+      tile (Unbundle) and inputs on the write tile (Bundle).
     - ``decomposeDataValRefNode`` -- the ``DataValueRef`` refnum is the INPUT on
       the read tile (it derefs the reference) and the OUTPUT on the write tile
-      (it hands the reference back). -> ``"DVR Read"`` / ``"DVR Write"``.
+      (it hands the reference back).
     - ``decomposeArrayNode`` -- the read tile only indexes (array in, element
       out); the write tile replaces (array back OUT). An array-kind OUTPUT means
-      the replace half. -> ``"Array Index"`` / ``"Array Replace"``.
+      the write tile.
 
-    Returns ``None`` when the discriminating type isn't present (leave the
-    node's fallback name untouched). Public NI docs: the border nodes are the
-    'Data Value Reference Read / Write Element' and 'Array Index / Replace
-    Elements' nodes -- these are the compact per-tile forms."""
+    Returns ``None`` when the discriminating terminal isn't present."""
+    if node_type == "decomposeClusterNode":
+        fields = [t for t in terminals if t.nmux_role == "list"]
+        if not fields:
+            return None
+        if fields[0].direction == "input":
+            return InPlaceBorderSide.WRITE
+        return InPlaceBorderSide.READ
     if node_type == "decomposeDataValRefNode":
         for t in terminals:
             lt = t.lv_type
             if lt is not None and lt.ref_type == "DataValueRef":
-                return "DVR Read" if t.direction == "input" else "DVR Write"
+                if t.direction == "input":
+                    return InPlaceBorderSide.READ
+                return InPlaceBorderSide.WRITE
         return None
     if node_type == "decomposeArrayNode":
         has_array_out = any(
@@ -596,8 +668,34 @@ def inplace_border_name(node_type: str, terminals: list[Terminal]) -> str | None
             and t.direction == "output"
             for t in terminals
         )
-        return "Array Replace" if has_array_out else "Array Index"
+        if has_array_out:
+            return InPlaceBorderSide.WRITE
+        return InPlaceBorderSide.READ
     return None
+
+
+_INPLACE_BORDER_NAMES = {
+    ("decomposeDataValRefNode", InPlaceBorderSide.READ): "DVR Read",
+    ("decomposeDataValRefNode", InPlaceBorderSide.WRITE): "DVR Write",
+    ("decomposeArrayNode", InPlaceBorderSide.READ): "Array Index",
+    ("decomposeArrayNode", InPlaceBorderSide.WRITE): "Array Replace",
+}
+
+
+def inplace_border_name(node_type: str, terminals: list[Terminal]) -> str | None:
+    """Faithful per-tile name for the two IN-PLACE-ELEMENT-STRUCTURE border
+    nodes that carry no field shape (unlike ``decomposeClusterNode``, which
+    goes through :func:`bundle_unbundle_name`): "DVR Read" / "DVR Write" and
+    "Array Index" / "Array Replace", from :func:`inplace_border_side`.
+
+    Returns ``None`` when the discriminating type isn't present (leave the
+    node's fallback name untouched). Public NI docs: the border nodes are the
+    'Data Value Reference Read / Write Element' and 'Array Index / Replace
+    Elements' nodes -- these are the compact per-tile forms."""
+    side = inplace_border_side(node_type, terminals)
+    if side is None:
+        return None
+    return _INPLACE_BORDER_NAMES.get((node_type, side))
 
 
 class FPTerminal(Terminal):
@@ -947,17 +1045,10 @@ def control_type_to_lvtype(control_type: str) -> LVType | None:
     return _CONTROL_TYPE_TO_LVTYPE.get(control_type)
 
 
-def _sanitize_type_name(typedef_name: str) -> str:
-    """Sanitize a typedef name into a valid Python identifier."""
-    name = typedef_name.split(":")[-1].replace(".ctl", "")
-    name = "".join(c for c in name if c.isalnum() or c == "_")
-    return name
-
-
 def _strip_typedef_stem(typedef_name: str) -> str:
     """The type's own display name from a possibly library-qualified
     ``typedef_name``: drop everything before the last ``:`` qualifier and
-    strip a ``.ctl`` control-file extension. UNLIKE ``_sanitize_type_name``,
+    strip a ``.ctl`` control-file extension. UNLIKE ``derive_python_name``,
     this is never mangled into a Python identifier — it's a LabVIEW label
     (``type_descriptor()``), not a codegen type name, so spaces/punctuation in the
     type's own name are kept verbatim (mirrors the stripping convention in

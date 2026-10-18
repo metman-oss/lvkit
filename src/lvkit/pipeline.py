@@ -13,18 +13,27 @@ import sys
 import textwrap
 import traceback
 from collections import defaultdict
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from lvkit.codegen import ClassBuilder, ClassConfig, build_module
-from lvkit.codegen.ast_utils import to_function_name, to_module_name
-from lvkit.codegen.import_resolver import ImportResolver, ModuleImport
+from lvkit.codegen.ast_utils import (
+    build_type_checking_block,
+    to_function_name,
+    to_module_name,
+    unique_names,
+)
+from lvkit.codegen.import_resolver import ImportResolver, ModuleImport, NameImport
+from lvkit.codegen.type_module import build_type_module
 from lvkit.graph import InMemoryVIGraph
 from lvkit.graph.loading import LoadMode
+from lvkit.graph.node_kinds import NodeType
 from lvkit.project_store import find_project_store
 from lvkit.structure import parse_lvclass
 from lvkit.terminal_collector import get_collector
+from lvkit.type_names import ROOT_CLASS, derive_python_name
 from lvkit.vilib_resolver import VILibResolver
 from lvkit.vilib_resolver import get_resolver as get_vilib_resolver
 
@@ -118,19 +127,48 @@ def to_library_name(
     return None
 
 
+# The dependency nodes that have a generated module.
+_MODULE_NODE_TYPES = (NodeType.VI, NodeType.CLASS, NodeType.TYPEDEF)
+
+
+def module_stem(vi_name: str, graph: InMemoryVIGraph | None = None) -> str:
+    """The module name of a VI from its own name, qualified by its class or
+    library when it has one (``TestCase.lvclass:run.vi`` -> ``testcaselvclass_run``)
+    -- never from the file's location. ``vi_name`` may be a graph key (a path)."""
+    display = graph.vi_display_name(vi_name) if graph is not None else vi_name
+    return to_module_name(display.replace(":", "_"))
+
+
+def unique_module_stems(
+    keys: list[str],
+    graph: InMemoryVIGraph | None = None,
+    reserved: Collection[str] = (),
+) -> dict[str, str]:
+    """A module name for each key, distinct across ``keys`` and from every
+    ``reserved`` name (the package folders): two VIs that share a name get
+    ``_2``, ``_3``... in the order of ``keys``."""
+    held = sorted(reserved)
+    stems = unique_names([*held, *(module_stem(k, graph) for k in keys)])
+    return dict(zip(keys, stems[len(held) :], strict=True))
+
+
 def get_output_path(
     output_dir: Path,
     vi_name: str,
     create_dirs: bool = True,
     graph: InMemoryVIGraph | None = None,
     vilib_resolver: VILibResolver | None = None,
+    module_name: str | None = None,
 ) -> tuple[Path, str | None]:
     """Get output path and library name for a VI.
 
     Returns (path, library_name) where path includes library subdirectory
-    if the VI belongs to a library, or the output root if it doesn't.
+    if the VI belongs to a library, or the output root if it doesn't. The
+    module is named ``module_name``, else from the VI's own name
+    (:func:`module_stem`).
     """
-    module_name = to_module_name(vi_name)
+    if module_name is None:
+        module_name = module_stem(vi_name, graph)
     library_name = to_library_name(vi_name, graph=graph, vilib_resolver=vilib_resolver)
 
     if library_name:
@@ -152,9 +190,11 @@ def create_import_resolver(
     package_name: str,
     output_dir: Path,
     vi_paths: dict[str, Path],
+    caller_path: Path,
+    caller_key: str | None = None,
     graph: InMemoryVIGraph | None = None,
     vilib_resolver: VILibResolver | None = None,
-    caller_library: str | None = None,
+    defined_names: Collection[str] = (),
 ) -> ImportResolver:
     """Create an import resolver for a VI.
 
@@ -162,18 +202,26 @@ def create_import_resolver(
         package_name: Name of the output package (e.g., "get_settings_path")
         output_dir: Root output directory
         vi_paths: Dict mapping fully qualified VI names to their output paths
+        caller_path: Output file of the module being generated. Every import is
+            relative to the package directory holding it.
+        caller_key: Graph key (source path) of the VI, class or typedef being
+            generated; the classes and typedefs it names are found among its own
+            dependencies.
         graph: Memory graph for library metadata lookup
         vilib_resolver: VILib resolver for vilib membership check
-        caller_library: Library subdirectory of the calling VI (e.g., "testcaselvclass")
+        defined_names: Class names the module defines itself; an import of the
+            same derived name gets an alias.
 
     Returns:
-        An ``ImportResolver``: called with a SubVI name it returns the import
-        statement for that SubVI's function; ``module`` gives the import of a
-        Global VI's module.
+        An ``ImportResolver``: ``function`` gives the import of a SubVI's
+        function; ``module`` the import of a Global VI's module; ``type_import``
+        the import of a class or typedef.
     """
 
-    def locate(subvi_name: str) -> tuple[str, str, str]:
-        """``(relative package prefix, dependency library, module)`` of a VI."""
+    caller_dir = caller_path.parent
+
+    def locate(subvi_name: str) -> Path:
+        """The output file of a generated VI."""
         # Resolve to qualified name for library lookup
         qualified = subvi_name
         if graph:
@@ -181,41 +229,91 @@ def create_import_resolver(
             if resolved_name:
                 qualified = resolved_name
 
-        # Look up the dependency's path
         if qualified in vi_paths:
-            dep_path = vi_paths[qualified]
-        elif subvi_name in vi_paths:
-            dep_path = vi_paths[subvi_name]
-        else:
-            dep_path, _ = get_output_path(
-                output_dir,
-                qualified,
-                create_dirs=False,
-                graph=graph,
-                vilib_resolver=vilib_resolver,
-            )
-
-        dep_library = to_library_name(
+            return vi_paths[qualified]
+        if subvi_name in vi_paths:
+            return vi_paths[subvi_name]
+        dep_path, _ = get_output_path(
+            output_dir,
             qualified,
+            create_dirs=False,
             graph=graph,
             vilib_resolver=vilib_resolver,
         )
-        # Relative import: go up from caller, down to dependency
-        up = ".." if caller_library else "."
-        return up, dep_library or "", dep_path.stem
+        return dep_path
 
-    def function_import(subvi_name: str) -> str:
-        up, dep_library, dep_module = locate(subvi_name)
-        down = f"{dep_library}.{dep_module}" if dep_library else dep_module
-        return f"from {up}{down} import {to_function_name(subvi_name)}"
+    def relative(dep_path: Path) -> tuple[str, str, str]:
+        """``(dots, package, module)``: the relative import of ``dep_path`` from
+        the package directory of the calling module, which sits ``depth``
+        directories below the output root."""
+        depth = len(caller_dir.relative_to(output_dir).parts)
+        below_root = dep_path.relative_to(output_dir).with_suffix("").parts
+        return "." * (depth + 1), ".".join(below_root[:-1]), below_root[-1]
+
+    # The name each imported class, typedef or function is spelled as in this
+    # module, by the identity of its node (its file path; the root class has no
+    # file). Two with the same derived name, or one with the name of what the
+    # module defines, are told apart by an alias.
+    spelled: dict[str, str] = {}
+    taken = set(defined_names)
+    if caller_key is not None:
+        taken.add(to_function_name(Path(caller_key).name))
+
+    def spell(identity: str, derived: str) -> str:
+        if identity not in spelled:
+            spelled[identity] = unique_names([*sorted(taken), derived])[-1]
+            taken.add(spelled[identity])
+        return spelled[identity]
+
+    def function_import(subvi_name: str) -> NameImport:
+        located = locate(subvi_name)
+        derived = to_function_name(subvi_name)
+        if located == caller_path:
+            return NameImport("", derived)
+        dots, package, module = relative(located)
+        dotted = f"{package}.{module}" if package else module
+        name = spell(f"function:{located}", derived)
+        alias = "" if name == derived else f" as {name}"
+        return NameImport(f"from {dots}{dotted} import {derived}{alias}", name)
 
     def module_import(global_vi_name: str) -> ModuleImport:
-        up, dep_library, dep_module = locate(global_vi_name)
-        alias = f"{dep_module}_global"
-        package = f"{up}{dep_library}" if dep_library else up
-        return ModuleImport(f"from {package} import {dep_module} as {alias}", alias)
+        dots, package, module = relative(locate(global_vi_name))
+        alias = f"{module}_global"
+        return ModuleImport(f"from {dots}{package} import {module} as {alias}", alias)
 
-    return ImportResolver(function_import, module_import)
+    def node_import(key: str) -> NameImport:
+        dots, package, module = relative(vi_paths[key])
+        dotted = f"{package}.{module}" if package else module
+        derived = derive_python_name(Path(key).name)
+        name = spell(key, derived)
+        alias = "" if name == derived else f" as {name}"
+        return NameImport(f"from {dots}{dotted} import {derived}{alias}", name)
+
+    def type_import(type_ref: str) -> NameImport | None:
+        if type_ref == ROOT_CLASS:
+            derived = derive_python_name(ROOT_CLASS)
+            name = spell(ROOT_CLASS, derived)
+            alias = "" if name == derived else f" as {name}"
+            return NameImport(
+                f"from lvkit.runtime.labview_object import {derived}{alias}", name
+            )
+        if graph is None or caller_key is None:
+            return None
+        key = graph.type_key(type_ref, caller_key)
+        if key is None or key not in vi_paths:
+            return None
+        return node_import(key)
+
+    return ImportResolver(function_import, module_import, type_import, node_import)
+
+
+def _type_definition_scope(graph: InMemoryVIGraph, key: str) -> str:
+    """The node whose dependencies the types named in a class's or typedef's
+    definition are found among: a typedef's own, and a class's private data
+    control's (the class itself depends on its parent and its methods)."""
+    if graph.is_class(key):
+        return graph.class_private_data_key(key) or key
+    return key
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +350,7 @@ def _generate_polymorphic_module(
     # the shared module header carries every one a variant references.
     _header = {ln for ln in lines if ln.startswith(("import ", "from "))}
     variant_imports: set[str] = set()
+    variant_annotation_imports: set[str] = set()
 
     for variant_name in variants:
         vi_context = graph.get_vi_context(variant_name)
@@ -262,18 +361,14 @@ def _generate_polymorphic_module(
         variant_funcs.append(func_name)
 
         try:
-            variant_lib = to_library_name(
-                variant_name,
-                graph=graph,
-                vilib_resolver=vilib_resolver,
-            )
             import_resolver = create_import_resolver(
                 package_name,
                 output_dir,
                 vi_paths,
+                vi_paths[wrapper_name],
+                caller_key=graph.resolve_vi_name(variant_name),
                 graph=graph,
                 vilib_resolver=vilib_resolver,
-                caller_library=variant_lib,
             )
             code = build_module(
                 vi_context,
@@ -297,6 +392,10 @@ def _generate_polymorphic_module(
                     imp = ast.unparse(node)
                     if imp not in _header:
                         variant_imports.add(imp)
+                elif isinstance(node, ast.If):
+                    variant_annotation_imports.update(
+                        ast.unparse(stmt) for stmt in node.body
+                    )
 
             # Collect inputs/outputs for union signature
             for inp in vi_context.inputs:
@@ -338,6 +437,11 @@ def _generate_polymorphic_module(
     # (after the fixed imports, before the blank line separating header/body).
     if variant_imports:
         lines[4:4] = sorted(variant_imports)
+    if variant_annotation_imports:
+        lines[4:4] = [
+            ast.unparse(stmt)
+            for stmt in build_type_checking_block(variant_annotation_imports)
+        ]
 
     # Generate wrapper function. Name it by the VI's DISPLAY name (basename),
     # not the full path — callers import it as to_function_name(node.name) (the
@@ -496,10 +600,21 @@ def generate_python(
 
     warm_all_loaded(graph)
 
-    order = graph.get_conversion_order()
+    # A library only scopes its members: it has no module, and nothing imports it.
+    order = [
+        key
+        for key in graph.get_conversion_order()
+        if graph.node_type(key) in _MODULE_NODE_TYPES
+    ]
     print(f"\nConversion order ({len(order)} VIs):")
 
     vilib_resolver = get_vilib_resolver()
+    library_folders = {
+        folder
+        for key in order
+        if (folder := to_library_name(key, graph=graph, vilib_resolver=vilib_resolver))
+    }
+    module_names = unique_module_stems(order, graph, reserved=library_folders)
 
     # Identify polymorphic groups (from VI metadata, not heuristics)
     poly_groups = graph.get_polymorphic_groups()
@@ -537,6 +652,7 @@ def generate_python(
             create_dirs=False,
             graph=graph,
             vilib_resolver=vilib_resolver,
+            module_name=module_names[vi_name],
         )
         vi_paths[vi_name] = path
 
@@ -581,8 +697,9 @@ def generate_python(
             vi_name,
             graph=graph,
             vilib_resolver=vilib_resolver,
+            module_name=module_names[vi_name],
         )
-        module_name = to_module_name(vi_name)
+        module_name = module_names[vi_name]
 
         if has_vilib:
             # Generate vilib/openg implementation
@@ -604,6 +721,32 @@ def {func_name}(*args, **kwargs) -> Any:
             output_path.write_text(code, encoding="utf-8")
             print(f"         -> stub: {output_path.name}")
             generated.append((vi_name, output_path, "stub"))
+
+        elif graph.is_class(vi_name) or graph.is_typedef(vi_name):
+            try:
+                code = build_type_module(
+                    graph,
+                    vi_name,
+                    create_import_resolver(
+                        vi_folder_name,
+                        output_dir_resolved,
+                        vi_paths,
+                        output_path,
+                        caller_key=_type_definition_scope(graph, vi_name),
+                        graph=graph,
+                        vilib_resolver=vilib_resolver,
+                        defined_names=[derive_python_name(Path(vi_name).name)],
+                    ),
+                )
+                ast.parse(code)
+                output_path.write_text(code, encoding="utf-8")
+                print(f"         -> type: {output_path.name}")
+                generated.append((vi_name, output_path, "ast"))
+            except Exception as e:  # noqa: BLE001 — per-type; keep generating remaining modules
+                error_path = output_dir_resolved / f"{module_name}.error.py"
+                error_path.write_text(f"# ERROR: {e}", encoding="utf-8")
+                print(f"         -> FAILED: {e}")
+                generated.append((vi_name, error_path, "error"))
 
         elif vi_name in poly_groups:
             # Generate polymorphic module with all variants
@@ -648,18 +791,14 @@ def {func_name}(*args, **kwargs) -> Any:
             code = ""
 
             try:
-                caller_lib = to_library_name(
-                    vi_name,
-                    graph=graph,
-                    vilib_resolver=vilib_resolver,
-                )
                 import_resolver = create_import_resolver(
                     vi_folder_name,
                     output_dir_resolved,
                     vi_paths,
+                    output_path,
+                    caller_key=vi_name,
                     graph=graph,
                     vilib_resolver=vilib_resolver,
-                    caller_library=caller_lib,
                 )
                 code = build_module(
                     vi_context,
@@ -696,11 +835,15 @@ def {func_name}(*args, **kwargs) -> Any:
     for wrapper_name, variants in poly_groups.items():
         wrapper_path = vi_paths.get(wrapper_name)
         if not wrapper_path:
+            module_names[wrapper_name] = unique_names(
+                [*module_names.values(), module_stem(wrapper_name, graph)]
+            )[-1]
             wrapper_path, _ = get_output_path(
                 output_dir_resolved,
                 wrapper_name,
                 graph=graph,
                 vilib_resolver=vilib_resolver,
+                module_name=module_names[wrapper_name],
             )
             vi_paths[wrapper_name] = wrapper_path
         if not wrapper_path.exists():
@@ -741,18 +884,14 @@ def {func_name}(*args, **kwargs) -> Any:
                 method_contexts[method.name] = ctx
 
         # Build class wrapper with context lookup for SubVI resolution
-        class_lib = to_library_name(
-            lvclass.name,
-            graph=graph,
-            vilib_resolver=vilib_resolver,
-        )
+        class_path = output_dir_resolved / (to_module_name(lvclass.name) + ".py")
         import_resolver = create_import_resolver(
             vi_folder_name,
             output_dir_resolved,
             vi_paths,
+            class_path,
             graph=graph,
             vilib_resolver=vilib_resolver,
-            caller_library=class_lib,
         )
         builder = ClassBuilder(config=ClassConfig())
         module = builder.build_class_module(
@@ -765,10 +904,8 @@ def {func_name}(*args, **kwargs) -> Any:
         class_code = ast.unparse(module)
 
         # Write class file
-        class_filename = to_module_name(lvclass.name) + ".py"
-        class_path = output_dir_resolved / class_filename
         class_path.write_text(class_code, encoding="utf-8")
-        print(f"\nGenerated class wrapper: {class_filename}")
+        print(f"\nGenerated class wrapper: {class_path.name}")
 
     print(f"\nOutput: {output_dir_resolved}")
 
