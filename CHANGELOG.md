@@ -3,6 +3,15 @@
 lvkit follows semantic versioning.
 
 ## [Unreleased]
+
+## [0.8.9] - 2026-10-17
+- **Global variables are their own node** — a global variable was read as a local variable of the calling VI; it now names its Global VI and control (from the VI's link table), shows in describe, lvnet (`global-variable … : read Data.vi::Debug`), render, diff and the index, and generated Python reads and writes the Global VI's module-level value (#141).
+- **Fix: a Global VI's interface was empty** — a Global VI has no block diagram; its front-panel controls are now its interface (#145).
+- **Shared Variable nodes are their own node** — name, read or write, and NI's terminal names, instead of a generic function (#149).
+- **Generated Python defines and imports every name it uses** — classes and type definitions get real modules (enums as `IntEnum`), imports resolve from library folders, error clusters through structures are left out (generated code raises exceptions instead), same-named imports get an alias, Disable structures generate their enabled subdiagram, and module files are named from the VI and its class or library.
+- **Fix: generated Python invented a variable for an unresolved Property or Invoke Node reference** — an unwired reference uses its class's default object, and an unsupported primitive's output raises a clear error when used (#142).
+- **Fix: In Place Element values didn't read back through lvnet** — border values are named nets, and values wired back are drive lines.
+- **Fix: string parameter defaults in generated Python were quoted twice**, and Format String with a wired format string generated `f'None'`.
 - **Fix: a Compound Arithmetic node set to Add with no other option read as an unknown mode** — it drew as "?" and generated Python failed on it; it now reads as Add (#116).
 - **Fix: `structure` on a `.lvproj` reported 0 VIs when the project holds only libraries and classes** — it now prints each library's and class's VI count and a total (JSON adds `vi_count` and `vis`), and files on another drive (`/C:/...` in the project) resolve on Windows (#131).
 - **A repeat `describe`/`render` of an unchanged project no longer writes the index** — a row already stored for the same VI bytes is left alone; a fuller load still upgrades it and a partial load never downgrades it (#131).
