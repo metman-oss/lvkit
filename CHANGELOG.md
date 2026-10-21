@@ -3,6 +3,8 @@
 lvkit follows semantic versioning.
 
 ## [Unreleased]
+
+## [0.8.11] - 2026-10-21
 - **Fix: Required and Optional connector-pane terminals are detected** — the wiring rule is read from the VI's own connector pane, so describe, lvnet, diff, render and generated Python show Required inputs and Optional terminals correctly (#173).
 - **Fix: terminal names landed on the wrong terminals** of 38 functions (Search and Replace String, VISA, TCP, Write to Text File, …) and of Insert Into Array — names now follow the slot the VI stores and are withheld when a node does not match its definition (#168).
 - **Resized array functions are named per dimension and set** (Index Array, Replace Array Subset, Array Subset, Insert Into Array, Delete From Array), and Replace Array Subset generates for any array rank with unwired indices starting at 0.
