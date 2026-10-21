@@ -15,6 +15,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
+from ..dotnet_types import DotNetAssembly
 from ..models import (
     CaseFrame,
     ClusterField,
@@ -26,6 +27,7 @@ from ..models import (
     SequenceFrame,
     SharedVariableKind,
     Terminal,
+    UnwritableValue,
     VIKind,
 )
 from ..parser.models import ParsedFrontPanel
@@ -272,12 +274,32 @@ class LoopNode(StructureNode):
     hidden_border_terminals: frozenset[str] = frozenset()
 
 
+class SequenceLocalLink(BaseModel):
+    """One sequence local of a Stacked Sequence as the graph sees it: the
+    frame terminal that writes it and the later-frame terminals that read it.
+    A local nothing is wired to has neither. A local wired in a way LabVIEW
+    does not allow (read but never written, written more than once, read in a
+    frame that does not come after its write, wired off the frame boundary) is
+    ``unreadable``: it gets no join between write and reads, and
+    ``unreadable_frame`` (its first frame with a wired terminal) is where the
+    reason is shown."""
+
+    write_terminal: str | None = None
+    write_frame: int | None = None
+    read_terminals: list[str] = []
+    unreadable: str | None = None
+    unreadable_frame: int | None = None
+
+
 class SequenceNode(StructureNode):
     """A flat or stacked sequence with ordered frames."""
 
     model_config = {"arbitrary_types_allowed": True}
 
     frames: list[SequenceFrame] = []
+    # Sequence locals in heap list order; the position is the ``K`` of the
+    # ``sequence_<uid>.local<K>`` net.
+    sequence_locals: list[SequenceLocalLink] = []
     # Frame a STACKED sequence last displayed (heap ``dIdx``, range-checked) —
     # the faithful initial view. None for a flat sequence (all frames shown)
     # and when ``dIdx`` is an out-of-range legacy ordinal → renderer opens
@@ -289,6 +311,11 @@ class SequenceNode(StructureNode):
     # out-of-range legacy stacked one). True = Flat Sequence, False = Stacked
     # Sequence.
     is_flat: bool = True
+
+    @property
+    def kind_word(self) -> str:
+        """``Flat`` or ``Stacked`` -- which kind of sequence this is."""
+        return "Flat" if self.is_flat else "Stacked"
 
 
 class InPlaceNode(StructureNode):
@@ -383,6 +410,9 @@ class ConstantNode(GraphNode):
     # for codegen. None for non-string constants (``value`` is already legible).
     # Mirrors the Terminal.name (codegen) vs display_name (display) split.
     display_value: str | None = None
+    # Set when ``value`` shows an array (itself, or inside a cluster) whose values
+    # were not kept because it is too large.
+    unwritable: UnwritableValue | None = None
     # ``label`` inherited from GraphNode (partID 16) — this IS the constant's
     # display text; codegen never treats a constant's label as an identity.
     # Raw printf-style numeric display-format string from the parser
@@ -640,6 +670,7 @@ class Constant(BaseModel):
     # ConstantNode so describe/netlist render the LabVIEW radix like the renderer.
     display_format: str | None = None
     raw_value: str | None = None
+    unwritable: UnwritableValue | None = None
     label: str | None = None  # LabVIEW label (partID 16), the author's caption
     # Structure containment (None = top-level diagram). Mirrors GraphNode:
     # parent = containing structure's node id, frame = selector value / index.
@@ -1073,6 +1104,16 @@ class VIMetadata:
     owning_libraries: list[str] = field(default_factory=list)
     # The VI's own documentation text (STRG/DSTM), shown in the hover help box.
     description: str | None = None
+
+
+@dataclass
+class VIDotNetAssemblies:
+    """The .NET assemblies a VI calls (from its ``DNVA`` / ``DNDA`` link records)
+    and why any such record could not be read. A sibling facet of ``VIMetadata``,
+    keyed by VI like it."""
+
+    assemblies: list[DotNetAssembly] = field(default_factory=list)
+    unreadable: list[str] = field(default_factory=list)
 
 
 # ============================================================

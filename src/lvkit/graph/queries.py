@@ -17,6 +17,7 @@ import networkx as nx
 
 from ..models import ClusterField, FPTerminal, Terminal
 from ..parser.models import ParsedDependencyRef, ParsedFrontPanel
+from ..type_names import ROOT_CLASS
 from ..vilib_resolver import get_resolver as get_vilib_resolver
 from .core import _OPERATION_KINDS, _graph_node_to_op_kind, _node_order_key
 from .interface_order import ordered_interface
@@ -40,6 +41,7 @@ from .models import (
     SubVICall,
     TerminalRef,
     VIContext,
+    VIDotNetAssemblies,
     VIHealth,
     VIMetadata,
     VINode,
@@ -107,6 +109,7 @@ class QueryMixin:
     _vi_metadata: dict[str, VIMetadata]
     _vi_properties: dict[str, VIProperties]
     _vi_health: dict[str, VIHealth]
+    _vi_dotnet_assemblies: dict[str, VIDotNetAssemblies]
     _layouts: dict[str, Layout]
     _search_paths: list[Path]
     _vilib_root: Path | None
@@ -438,7 +441,7 @@ class QueryMixin:
         """The name the class at ``key`` records for its parent, loaded or not;
         ``None`` for a class that descends directly from LabVIEW Object."""
         parent = self._dep_graph.nodes[key].get("parent_class")
-        return parent if parent and parent != "LabVIEW Object" else None
+        return parent if parent and parent != ROOT_CLASS else None
 
     def global_vi_key(self, node: GlobalVariableNode) -> str | None:
         """The dependency key (the Global VI's file path) a global variable node
@@ -792,6 +795,7 @@ class QueryMixin:
                     lv_type=gnode.lv_type,
                     display_format=gnode.display_format,
                     raw_value=gnode.raw_value,
+                    unwritable=gnode.unwritable,
                     label=gnode.label,
                     parent=gnode.parent,
                     frame=gnode.frame,
@@ -1096,6 +1100,12 @@ class QueryMixin:
         vi_name = self.resolve_vi_name(vi_name)
         return self._vi_health.get(vi_name, VIHealth())
 
+    def get_dotnet_assemblies(self, vi_name: str) -> VIDotNetAssemblies:
+        """The .NET assemblies the VI calls, and the link records that could not
+        be read."""
+        vi_name = self.resolve_vi_name(vi_name)
+        return self._vi_dotnet_assemblies.get(vi_name, VIDotNetAssemblies())
+
     def get_vi_front_panel(self, vi_name: str) -> ParsedFrontPanel | None:
         """The VI's OWN front-panel layout (every control, not just the
         connector-pane subset), or None when the VI is unknown or its node
@@ -1392,7 +1402,7 @@ class QueryMixin:
         if key is None:
             return None
         parent_raw = self._dep_graph.nodes[key].get("parent_class")
-        if parent_raw and parent_raw != "LabVIEW Object":
+        if parent_raw and parent_raw != ROOT_CLASS:
             return parent_raw + ".lvclass"
         return None
 

@@ -12,13 +12,46 @@ element-wise behaviour over multidimensional arrays.
 
 from __future__ import annotations
 
+import array as _array
+import copy as _copy
 import math as _math
 import operator as _op
 import random as _random
 import re as _re
 import sys as _sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from pathlib import Path as _Path
 from typing import Literal
+
+
+def load_array(
+    module_file: str,
+    data_file: str,
+    typecode: str,
+    dimensions: Sequence[int],
+    as_bool: bool = False,
+) -> list:
+    """An array too large to write into the module: its elements, as the VI
+    stores them (big-endian, row-major), read from ``data_file`` beside the
+    module (``module_file`` is the module's ``__file__``). ``typecode`` is the
+    ``array`` module's code for the element type; ``as_bool`` reads one-byte
+    elements as Booleans. The result is a list nested one level per dimension,
+    the same shape as every other array."""
+    values = _array.array(typecode)
+    values.frombytes((_Path(module_file).parent / data_file).read_bytes())
+    if values.itemsize > 1 and _sys.byteorder == "little":
+        values.byteswap()
+    flat = [bool(v) for v in values] if as_bool else values.tolist()
+    return _nest(flat, list(dimensions))
+
+
+def _nest(flat: list, sizes: list[int]) -> list:
+    if len(sizes) <= 1:
+        return flat
+    row = 1
+    for size in sizes[1:]:
+        row *= size
+    return [_nest(flat[i * row : (i + 1) * row], sizes[1:]) for i in range(sizes[0])]
 
 
 def _binop(a, b, f: Callable):
@@ -336,6 +369,41 @@ def array_subset(arr, index, length):
     if length is None:
         return arr[i:]
     return arr[i:i + int(length)]
+
+
+def replace_array_subset(arr, new, offsets, new_rank: int):
+    """Replace Array Subset (node class ``aReplace``) for one new element or
+    subarray, for an array of any rank (``len(offsets)``).
+
+    ``offsets`` holds one start index per dimension (an unwired index is 0).
+    The new element's ``new_rank`` dimensions lie along the array's last
+    dimensions; the leading dimensions pick the cell it lands in. The result is
+    a copy; the input array is not modified. Per NI's page, any subarray too
+    large to fit is cropped, and if any index is negative or larger than its
+    dimension the function has no effect."""
+    rank = len(offsets)
+    out = _copy.deepcopy(arr)
+    sizes = []
+    level = out
+    for _ in range(rank):
+        sizes.append(len(level))
+        level = level[0] if level else []
+    if any(not 0 <= int(i) < size for i, size in zip(offsets, sizes)):
+        return out
+    lead = rank - new_rank
+
+    def place(a, depth, sub):
+        if depth == rank:
+            return sub
+        start = int(offsets[depth])
+        if depth < lead:
+            a[start] = place(a[start], depth + 1, sub)
+            return a
+        for k in range(max(0, min(len(sub), len(a) - start))):
+            a[start + k] = place(a[start + k], depth + 1, sub[k])
+        return a
+
+    return place(out, 0, new)
 
 
 def array_size(a, ndims: int):

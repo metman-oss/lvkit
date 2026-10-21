@@ -7,8 +7,9 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+from collections.abc import Callable
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import networkx as nx
 
@@ -21,9 +22,11 @@ from ..models import (
     Tunnel,
     TunnelMode,
     TunnelTerminal,
+    UnwritableValue,
     bundle_unbundle_name,
     control_type_to_lvtype,
     enum_values_from_labels,
+    find_unwritable,
     inplace_border_name,
 )
 from ..parser import (
@@ -71,8 +74,17 @@ from .models import (
     WireEnd,
 )
 from .queries import AmbiguousVIReferenceError
+from .terminal_layout import array_rank
+from .terminal_names import NodeSlot, catalog_terminal_names
 
 logger = logging.getLogger(__name__)
+
+
+def _array_rank_lookup(
+    types_by_index: dict[int, LVType | None],
+) -> Callable[[int], int | None]:
+    """Dimension count of the array on a node terminal, by terminal index."""
+    return lambda index: array_rank(types_by_index.get(index))
 
 # All node types that represent a SubVI call (dynamic or static). Single source
 # of truth lives with the SubVI build handler; callByRefNode is included for node
@@ -195,15 +207,36 @@ def _control_ring_type(lv_type: LVType | None, ctrl: Any) -> LVType | None:
     return _ring_type(lv_type, ctrl.enum_values, ctrl.ring_values)
 
 
+def _default_for(ctrl: ParsedFPControl | None, lv_type: LVType | None) -> str | None:
+    """A control's default value. A default holding a class instance is read again
+    with the class's private-data fields, which are known only once the class is
+    loaded (``lv_type`` carries them); every other default is as the parse read it."""
+    if ctrl is None:
+        return None
+    if ctrl.default_raw is not None and lv_type is not None:
+        value, _, _ = _decode_element(ctrl.default_raw, lv_type)
+        if value is not None:
+            return value
+    return ctrl.default_value
+
+
+class DecodedConstant(NamedTuple):
+    """A decoded constant: its Python type, its byte-faithful (latin-1) value for
+    codegen, the codepage-decoded readable form for a string constant (else None,
+    see ``ConstantNode.display_value``), and the array inside it whose values were
+    not kept (else None)."""
+
+    python_type: str
+    value: str
+    display_value: str | None
+    unwritable: UnwritableValue | None
+
+
 def decode_constant(
     const: ParsedConstant,
     lv_type: LVType | None = None,
-) -> tuple[str, str, str | None]:
-    """Decode a constant to (python_type, codegen_value, display_value).
-
-    ``codegen_value`` is byte-faithful (latin-1) for correct execution;
-    ``display_value`` is the codepage-decoded readable form for a string
-    constant (else None). See ConstantNode.display_value.
+) -> DecodedConstant:
+    """Decode a constant to its ``DecodedConstant``.
 
     Args:
         const: The constant to decode
@@ -215,8 +248,10 @@ def decode_constant(
         raw_bytes = bytes.fromhex(value)
         underlying = getattr(lv_type, "underlying_type", "")
         if underlying == "Boolean" and len(raw_bytes) > 1:
-            return (lv_type.to_python(), "True" if any(raw_bytes) else "False", None)
-        decoded, _, _ = _decode_element(raw_bytes, lv_type)
+            return DecodedConstant(
+                lv_type.to_python(), "True" if any(raw_bytes) else "False", None, None
+            )
+        decoded, _, structured = _decode_element(raw_bytes, lv_type)
         display = (
             _string_display_value(raw_bytes)
             if underlying in ("String", "Tag")
@@ -224,10 +259,12 @@ def decode_constant(
         )
         py_type = lv_type.to_python()
         if decoded is not None:
-            return (py_type, decoded, display)
-        return (py_type, get_default_for_type(lv_type), display)
+            return DecodedConstant(
+                py_type, decoded, display, find_unwritable(structured)
+            )
+        return DecodedConstant(py_type, get_default_for_type(lv_type), display, None)
 
-    return ("raw", value, None)
+    return DecodedConstant("raw", value, None, None)
 
 
 # Type categories for terminal matching
@@ -325,6 +362,9 @@ class ConstructionMixin:
             _parsed_type: ParsedType | None,
         ) -> LVType | None: ...
         def resolve_vi_name(self, _vi_name: str) -> str: ...
+        def with_class_levels(
+            self, _lv_type: LVType | None, _caller_vi_key: str | None = None
+        ) -> LVType | None: ...
 
     @staticmethod
     def _enrich_nmux_terminals(
@@ -481,6 +521,7 @@ class ConstructionMixin:
                 lv_type = control_type_to_lvtype(control_type_str)
 
             lv_type = _control_ring_type(lv_type, ctrl)
+            lv_type = self.with_class_levels(lv_type, vi_key)
 
             q_term_uid = self._qid(vi_key, fp_term.uid)
             terminal = FPTerminal(
@@ -496,7 +537,8 @@ class ConstructionMixin:
                 caption_visible=ctrl.caption_visible if ctrl else False,
                 fp_dco_uid=fp_term.fp_dco_uid,
                 control_type=ctrl.control_type if ctrl else None,
-                default_value=ctrl.default_value if ctrl else None,
+                default_value=_default_for(ctrl, lv_type),
+                unwritable=ctrl.unwritable if ctrl else None,
                 enum_values=ctrl.enum_values if ctrl else [],
             )
             vi_terminals.append(terminal)
@@ -570,8 +612,11 @@ class ConstructionMixin:
             if term_info and term_info.parsed_type:
                 lv_type = self._enrich_type(term_info.parsed_type)
             lv_type = _ring_type(lv_type, const.ring_labels, const.ring_values)
+            lv_type = self.with_class_levels(lv_type, vi_key)
 
-            _, decoded_value, display_value = decode_constant(const, lv_type=lv_type)
+            _, decoded_value, display_value, unwritable = decode_constant(
+                const, lv_type=lv_type
+            )
 
             q_const_uid = self._qid(vi_key, const.uid)
             # Single output terminal
@@ -589,6 +634,7 @@ class ConstructionMixin:
                 lv_type=lv_type,
                 raw_value=const.value,
                 display_value=display_value,
+                unwritable=unwritable,
                 label=const.label,
                 display_format=const.display_format,
                 collapsed=const.collapsed,
@@ -682,6 +728,10 @@ class ConstructionMixin:
             # Get known terminal layout for index matching.
             # Same system for all node types: primitives, node_types, vilib SubVIs.
             known_terminals = None
+            # Primitive and node-type entries define every terminal of the
+            # node; vi.lib entries list only the terminals callers were seen
+            # using.
+            terminals_are_complete = True
             if isinstance(node, ParserPrimitiveNode) and node.prim_res_id:
                 prim_resolved = resolve_primitive(prim_id=node.prim_res_id)
                 if prim_resolved and prim_resolved.terminals:
@@ -705,6 +755,7 @@ class ConstructionMixin:
                     vilib_vi = vilib_r.resolve_by_name(subvi_name)
                 if vilib_vi and vilib_vi.terminals:
                     known_terminals = vilib_vi.terminals
+                    terminals_are_complete = False
 
             # Collect terminals, then resolve unknown indices by elimination
             raw_terms: list[tuple[str, Any, LVType | None]] = []
@@ -730,11 +781,20 @@ class ConstructionMixin:
             # <title> tooltip, and describe (real "x"/"y"/"difference" instead
             # of "terminal N"); the caller almost never labels a primitive's
             # terminals, so without this they are anonymous.
-            known_names: dict[int, str] = {}
-            if known_terminals:
-                for kt in known_terminals:
-                    if kt.name and kt.index is not None:
-                        known_names[kt.index] = kt.name
+            # Names are used only when every terminal of this node fits the
+            # definition (see graph/terminal_names.py); otherwise each terminal
+            # keeps its bare index.
+            known_names = catalog_terminal_names(
+                [
+                    NodeSlot(t_info.index, "out" if t_info.is_output else "in")
+                    for _, t_info, _ in raw_terms
+                ],
+                known_terminals or [],
+                lists_every_terminal=terminals_are_complete,
+                rank_of=_array_rank_lookup(
+                    {t_info.index: lv_type for _, t_info, lv_type in raw_terms}
+                ),
+            )
 
             # Snapshot of term_lookup keys before this node registers any of
             # its own (raw_terms below, plus — for structures — the tunnel/
@@ -752,7 +812,10 @@ class ConstructionMixin:
                     index=t_info.index,
                     direction="output" if t_info.is_output else "input",
                     name=t_info.name,
-                    display_name=t_info.name or known_names.get(t_info.index),
+                    display_name=t_info.name
+                    or known_names.get(
+                        (t_info.index, "out" if t_info.is_output else "in")
+                    ),
                     lv_type=lv_type,
                     inverted=t_info.inverted,
                     dco_uid=t_info.dco_uid,
@@ -1188,6 +1251,7 @@ class ConstructionMixin:
         if lv_type is None:
             lv_type = control_type_to_lvtype(ctrl.control_type)
         lv_type = _control_ring_type(lv_type, ctrl)
+        lv_type = self.with_class_levels(lv_type, vi_key)
         return FPTerminal(
             id=self._qid(vi_key, f"fp{ctrl.uid}"),
             index=None,
@@ -1200,7 +1264,8 @@ class ConstructionMixin:
             caption_visible=ctrl.caption_visible,
             fp_dco_uid=ctrl.uid,
             control_type=ctrl.control_type,
-            default_value=ctrl.default_value,
+            default_value=_default_for(ctrl, lv_type),
+            unwritable=ctrl.unwritable,
             enum_values=ctrl.enum_values,
         )
 
