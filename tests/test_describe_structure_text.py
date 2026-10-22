@@ -23,6 +23,7 @@ from lvkit.graph.models import (
     LoopNode,
     SequenceNode,
     VIContext,
+    VINode,
     WireEnd,
 )
 from lvkit.graph.models import PrimitiveNode as GraphPrimitiveNode
@@ -120,7 +121,7 @@ def test_selector_from_a_constant_is_named_by_its_value() -> None:
     constant = Constant(id=f"{_VI}::14945", value=False)
     ctx = VIContext(name=_VI)
     named = _resolve_selector(
-        graph, ctx, {constant.id: constant}, case.selector_terminal
+        graph, ctx, _VI, {constant.id: constant}, case.selector_terminal
     )
     assert named is not None
     assert "::" not in named
@@ -137,7 +138,7 @@ def test_selector_from_a_local_variable_is_named_by_its_control() -> None:
     )
     graph, case = _selector_graph(local, local.id)
     ctx = VIContext(name=_VI)
-    named = _resolve_selector(graph, ctx, {}, case.selector_terminal)
+    named = _resolve_selector(graph, ctx, _VI, {}, case.selector_terminal)
     assert named == "Init (local variable)"
 
 
@@ -146,7 +147,7 @@ def test_unwired_selector_names_nothing() -> None:
     case = _case(None, [])
     register_nodes(graph, [case], vi_name=_VI)
     assert (
-        _resolve_selector(graph, VIContext(name=_VI), {}, case.selector_terminal)
+        _resolve_selector(graph, VIContext(name=_VI), _VI, {}, case.selector_terminal)
         is None
     )
 
@@ -199,6 +200,24 @@ def test_named_output_is_node_dot_terminal() -> None:
     )
     named = _name_traced_source(InMemoryVIGraph(), _traced(node, term), {})
     assert named == "Wait on Notification.timed_out"
+
+
+def test_subvi_output_keeps_the_call_name_and_terminal() -> None:
+    call_id = "Caller.vi::50"
+    term = Terminal(
+        id=f"{call_id}::51",
+        index=2,
+        direction="output",
+        display_name="Found?",
+    )
+    call = VINode(
+        id=call_id,
+        vi_path="Check If Line Exists.vi",
+        name="Check If Line Exists.vi",
+        terminals=[term],
+    )
+    named = _name_traced_source(InMemoryVIGraph(), _traced(call, term), {})
+    assert named == "Check If Line Exists.vi.Found?"
 
 
 # --- real VIs ------------------------------------------------------------------
@@ -258,6 +277,17 @@ def test_case_selector_wired_from_a_constant_is_named_by_value() -> None:
     assert 'gated on "False"' in text
     assert "selector:" not in text
     assert ".vi::" not in text
+
+
+@pytest.mark.needs_samples
+def test_case_selector_wired_from_the_vis_own_control_is_named_by_label() -> None:
+    text = _describe(
+        _SAMPLES / "JKI-VI-Tester" / "source",
+        "Utilities/Tree_Control_VIs/Item Indent.vi",
+        _SAMPLES / "JKI-VI-Tester" / "source",
+    )
+    assert "gated on error in (no error)" in text
+    assert "Item Indent.vi.error" not in text
 
 
 @pytest.mark.needs_samples

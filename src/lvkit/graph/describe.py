@@ -48,7 +48,6 @@ from .models import (
 from .netlist_build import (
     StructureBorder,
     TracedSource,
-    case_frame_label_gn,
     case_selector_type_gn,
     sequence_local_read_gn,
     trace_source_gn,
@@ -57,11 +56,13 @@ from .node_kinds import EdgeRel
 from .op_walk import (
     _const_value_str,
     _render_ports,
+    _selector_label,
     _subvi_ports,
     _terminal_display_name,
+    selector_values_quoted_one_by_one,
 )
 from .queries import collect_class_context
-from .render_lvnet import _quoted_frame_label, lvnet_literal_token
+from .render_lvnet import lvnet_literal_token
 from .tunnel_names import (
     carried_name,
     condition_name,
@@ -211,6 +212,7 @@ def describe_vi(
     structures = _collect_structures(
         graph,
         ctx,
+        vi_name,
         top_nodes,
         {c.id: c for c in ctx.constants},
     )
@@ -691,6 +693,7 @@ def _name_traced_source(
 def _resolve_selector(
     graph: InMemoryVIGraph,
     ctx: VIContext,
+    vi_name: str,
     constants: dict[str, Constant],
     selector_terminal: str | None,
 ) -> str | None:
@@ -700,7 +703,7 @@ def _resolve_selector(
     VI's constants by node id. ``None`` when nothing is wired."""
     if not selector_terminal:
         return None
-    traced = trace_source_gn(graph, ctx, ctx.name, selector_terminal)
+    traced = trace_source_gn(graph, ctx, vi_name, selector_terminal)
     if traced is None:
         return None
     return _name_traced_source(graph, traced, constants)
@@ -709,6 +712,7 @@ def _resolve_selector(
 def _collect_structures(
     graph: InMemoryVIGraph,
     ctx: VIContext,
+    vi_name: str,
     nodes: list[AnyGraphNode],
     constants: dict[str, Constant],
 ) -> list[str]:
@@ -729,6 +733,7 @@ def _collect_structures(
                 gated = _resolve_selector(
                     graph,
                     ctx,
+                    vi_name,
                     constants,
                     node.selector_terminal,
                 )
@@ -736,11 +741,12 @@ def _collect_structures(
                 structures.append(
                     f"Case structure ({_frame_count(len(node.frames))}{sel})"
                 )
-                fmap = _frame_child_nodes(graph, node, vi_name=ctx.name)
+                fmap = _frame_child_nodes(graph, node, vi_name=vi_name)
                 for frame in node.frames:
                     for s in _collect_structures(
                         graph,
                         ctx,
+                        vi_name,
                         fmap.get(frame.selector_value, []),
                         constants,
                     ):
@@ -750,6 +756,7 @@ def _collect_structures(
                 gated = _resolve_selector(
                     graph,
                     ctx,
+                    vi_name,
                     constants,
                     node.stop_condition_terminal,
                 )
@@ -763,22 +770,24 @@ def _collect_structures(
                         structures.append(
                             f"  \\ Sequence local {k} unreadable: {link.unreadable}"
                         )
-                fmap = _frame_child_nodes(graph, node, vi_name=ctx.name)
+                fmap = _frame_child_nodes(graph, node, vi_name=vi_name)
                 for frame in node.frames:
                     for s in _collect_structures(
                         graph,
                         ctx,
+                        vi_name,
                         fmap.get(str(frame.index), []),
                         constants,
                     ):
                         structures.append(f"  \\ {s}")
             case EventStructureNode():
                 structures.append(f"Event structure ({_frame_count(len(node.frames))})")
-                fmap = _frame_child_nodes(graph, node, vi_name=ctx.name)
+                fmap = _frame_child_nodes(graph, node, vi_name=vi_name)
                 for i in range(len(node.frames)):
                     for s in _collect_structures(
                         graph,
                         ctx,
+                        vi_name,
                         fmap.get(str(i), []),
                         constants,
                     ):
@@ -787,11 +796,12 @@ def _collect_structures(
                 structures.append(
                     f"Disable structure ({_frame_count(len(node.frames))})"
                 )
-                fmap = _frame_child_nodes(graph, node, vi_name=ctx.name)
+                fmap = _frame_child_nodes(graph, node, vi_name=vi_name)
                 for frame in node.frames:
                     for s in _collect_structures(
                         graph,
                         ctx,
+                        vi_name,
                         fmap.get(frame.selector_value, []),
                         constants,
                     ):
@@ -803,7 +813,8 @@ def _collect_structures(
             for s in _collect_structures(
                 graph,
                 ctx,
-                _body_child_nodes(graph, node, ctx.name),
+                vi_name,
+                _body_child_nodes(graph, node, vi_name),
                 constants,
             )
         )
@@ -844,11 +855,14 @@ def _frame_constants(
 def _case_frame_header(node: CaseStructureNode, frame: CaseFrame) -> str:
     """A case frame's header text: the same label lvnet and JSON show for it
     (enum item names, ``No Error``/``Error``, integer ranges, quoted strings),
-    marked ``(default)`` when it is the default frame and the label does not
-    already say so."""
-    label = _quoted_frame_label(case_frame_label_gn(node, frame))
-    _, is_error = case_selector_type_gn(node)
-    return f"{label} (default)" if frame.is_default and is_error else label
+    which carries its own Default marker where one applies. Quoting is lvnet's
+    (``lvnet_literal_token``): a string selector quotes each of its values, any
+    other label is quoted once as a whole."""
+    lv_type, is_error = case_selector_type_gn(node)
+    label = _selector_label(frame, lv_type, is_error, quote_value=lvnet_literal_token)
+    if selector_values_quoted_one_by_one(frame, lv_type, is_error):
+        return label
+    return lvnet_literal_token(label)
 
 
 def _describe_frame_body(

@@ -21,10 +21,12 @@ from lvkit.graph import InMemoryVIGraph
 from lvkit.graph.describe import describe_vi
 from lvkit.graph.lvnet_parse import netlist_signature, parse_lvnet
 from lvkit.graph.lvnet_reconstruct import reconstruct_module
+from lvkit.graph.models import PrimitiveNode, VINode
 from lvkit.graph.netlist import NetlistModule, build_netlist_from_graph, render_lvnet
 from lvkit.graph.netlist_json import netlist_to_dict
+from lvkit.graph.render_lvnet import lvnet_type_ref
 from lvkit.load_mode import LoadMode
-from lvkit.models import LVType, LVTypeKind
+from lvkit.models import LVType, LVTypeKind, Terminal
 from lvkit.parser import vi as vi_parser
 from lvkit.parser.link_table import (
     DotNetAssemblyRecordFailure,
@@ -36,6 +38,7 @@ from lvkit.parser.link_table import (
 from lvkit.parser.models import ParsedTerminalInfo, ParsedType
 from lvkit.parser.vi import _process_element_terminals
 
+from .helpers import register_nodes
 from .test_link_table import V12, V20, V86, _pth0
 from .test_lvnet_roundtrip import _first_mismatch
 
@@ -268,6 +271,66 @@ def test_the_descriptor_shows_the_dotnet_type() -> None:
         kind=LVTypeKind.PRIMITIVE, underlying_type="NumInt32", dotnet_type=interface
     )
     assert enum_parameter.type_descriptor() == "MccDaq.DaqDeviceInterface"
+
+
+def test_a_dotnet_array_terminal_reads_like_a_dotnet_refnum(tmp_path: Path) -> None:
+    """A .NET node's terminals in lvnet: the scalar refnum and the array of .NET
+    objects both name their .NET type in ``DotNet refnum{...}``; an ordinary
+    array keeps its ``[I32]`` label."""
+    vi = str(tmp_path / "DotNet.vi")
+    scalar = LVType(
+        kind=LVTypeKind.PRIMITIVE,
+        underlying_type="Refnum",
+        ref_type="DotNet",
+        dotnet_type=DotNetType.from_qualified(ERROR_INFO_TYPE),
+    )
+    dotnet_array = LVType(
+        kind=LVTypeKind.ARRAY,
+        dimensions=1,
+        element_type=_refnum(),
+        dotnet_type=DotNetType.from_qualified(INVENTORY_TYPE),
+    )
+    ordinary_array = LVType(
+        kind=LVTypeKind.ARRAY,
+        dimensions=1,
+        element_type=LVType(kind=LVTypeKind.PRIMITIVE, underlying_type="NumInt32"),
+    )
+    terminals = [
+        Terminal(
+            id=f"{vi}::11",
+            index=0,
+            direction="input",
+            display_name="error info",
+            lv_type=scalar,
+        ),
+        Terminal(
+            id=f"{vi}::12",
+            index=1,
+            direction="output",
+            display_name="inventory",
+            lv_type=dotnet_array,
+        ),
+        Terminal(
+            id=f"{vi}::13",
+            index=2,
+            direction="output",
+            display_name="counts",
+            lv_type=ordinary_array,
+        ),
+    ]
+    node = PrimitiveNode(
+        id=f"{vi}::10", vi_path=vi, name="Call Library", terminals=terminals
+    )
+    vi_node = VINode(id=vi, vi_path=vi, name="DotNet.vi")
+    graph = InMemoryVIGraph()
+    register_nodes(graph, [vi_node, node], vi_name=vi)
+    text = render_lvnet(build_netlist_from_graph(graph, vi), display_name="DotNet.vi")
+    assert (
+        "    function Call_Library_10 : Call Library\n"
+        "      in   error info : DotNet refnum{MccDaq.ErrorInfo} default\n"
+        "      out  inventory  : DotNet refnum{MccDaq.DaqDeviceDescriptor[]}\n"
+        "      out  counts     : [I32]"
+    ) in text
 
 
 # --- reading the type from a node's DCO ---
@@ -534,3 +597,13 @@ def test_a_sidecar_record_without_a_version_is_reported(tmp_path: Path) -> None:
     )
     assert table.links == []
     assert "records no version" in table.failures[0].reason
+
+
+def test_dotnet_type_names_only_an_array_in_lvnet() -> None:
+    plain_enum = LVType(kind=LVTypeKind.ENUM, underlying_type="EnumU16")
+    dotnet_enum = LVType(
+        kind=LVTypeKind.ENUM,
+        underlying_type="EnumU16",
+        dotnet_type="MccDaq.DaqDeviceInterface, MccDaq",
+    )
+    assert lvnet_type_ref(dotnet_enum) == lvnet_type_ref(plain_enum)
